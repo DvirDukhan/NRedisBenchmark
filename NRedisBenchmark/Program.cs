@@ -5,26 +5,38 @@ using System.Threading.Tasks;
 using System.Diagnostics;
 using CommandLine;
 using Newtonsoft.Json;
+using ServiceStack.Redis;
+using System.Collections.Generic;
 
 namespace NRedisBenchmark
 {
     class Program
     {
+
         class Options
         {
-            [Option("app_threads", Required = false, HelpText = "Set the number of application threads.", Default = 24)]
-            public int AppThreads { get; set; }
+
+            static int proc_count = Environment.ProcessorCount;
+
+            [Option('h', "host", Required = false, HelpText = "Redis Server address", Default = "localhost")]
+            public string Host { get; set; }
+
+            [Option('p', "port", Required = false, HelpText = "Redis Server port", Default = "6379")]
+            public string Port { get; set; }
+
+            [Option("app_clients", Required = false, HelpText = "Set the number of application clients.", Default = 24)]
+            public int AppClients { get; set; }
 
             [Option('d', "dynamic", Required = false, HelpText = "Application threads are created with 1 second interval.", Default = true)]
             public bool Dynamic { get; set; }
 
-            [Option("worker_threads", Required = false, HelpText = "Set the number of .net worker threads.", Default = 24)]
+            [Option("worker_threads", Required = false, HelpText = "Set the number of .net worker threads.", Default = 300)]
             public int WorkerThreads { get; set; }
 
-            [Option("io_threads", Required = false, HelpText = "Set the number of .net io threads.", Default = 24)]
+            [Option("io_threads", Required = false, HelpText = "Set the number of .net io threads.", Default = 300)]
             public int IOThreads { get; set; }
 
-            [Option('p', "profile", Required = false, HelpText = "When set to true, the application will wait 30 seconds for attaching profilers.", Default = false)]
+            [Option("profile", Required = false, HelpText = "When set to true, the application will wait 30 seconds for attaching profilers.", Default = false)]
             public bool Profile { get; set; }
 
             [Option("hash_size", Required = false, HelpText = "Set the number of fields in a hash.", Default = 15)]
@@ -43,10 +55,14 @@ namespace NRedisBenchmark
             public int Requests { get; set; }
         }
 
+        private static string _host;
+
+        private static string _port;
+
         private static int _hashSize;
         private static int _workerThreads;
         private static int _ioThreads;
-        private static int _appThreads;
+        private static int _appClients;
         private static bool _dynamic;
         private static string _keyName;
         private static bool _profile;
@@ -72,46 +88,19 @@ namespace NRedisBenchmark
                        _hashSize = o.HashSize;
                        _workerThreads = o.WorkerThreads;
                        _ioThreads = o.IOThreads;
-                       _appThreads = o.AppThreads;
+                       _appClients = o.AppClients;
                        _dynamic = o.Dynamic;
                        _muxCount = o.MuxCount;
                        _multiplexers = new IConnectionMultiplexer[_muxCount];
                        _timeout = TimeSpan.FromMinutes(o.TimeOut);
                        _requests = o.Requests;
+                       _host = o.Host;
+                       _port = o.Port;
                        execute();
                    });
         }
 
-        private static void execute()
-        {
-            if (_profile)
-            {
-                Console.WriteLine($"Waiting 30 seconds for you to run attach with monitor tools. PID is {Process.GetCurrentProcess().Id}");
-                Thread.Sleep(30000);
-            }
-            ThreadPool.SetMinThreads(_workerThreads, _ioThreads);
-            ThreadPool.GetMinThreads(out _workerThreads, out _ioThreads);
-            _ct = new CancellationTokenSource(_timeout);
-            for (int i = 0; i < _muxCount; i++)
-            {
-                _multiplexers[i] = ConnectionMultiplexer.Connect("localhost");
-            }
-           _multiplexers[0].GetDatabase().KeyDelete(_keyName);
-            var t = Task.Factory.StartNew(() => printResults());
-            for (int i = 0; i < _appThreads; i++)
-            {
-                ThreadPool.QueueUserWorkItem(state => RedisQuery(_multiplexers[i % _muxCount]));
-                Console.WriteLine($"Created {i + 1} application threads");
-                Console.WriteLine($"number of fields in hash {_hashSize}, multiplexers {_muxCount}, application threads {i}, .net worker threads {_workerThreads}, .net io threads {_ioThreads}");
-                if (_dynamic)
-                {
-                    Thread.Sleep(1000);
-                }
-            }
-            t.Wait();
-        }
-
-        public static void RedisQuery(object obj)
+        public static void SERedisQuery(object obj)
         {
             int requestsSent = 0;
             while (!_ct.IsCancellationRequested && requestsSent < _requests)
@@ -133,16 +122,106 @@ namespace NRedisBenchmark
             }
         }
 
-        public static void printResults()
+        private static void SERedisBenchmark()
+        {
+            ThreadPool.SetMinThreads(_workerThreads, _ioThreads);
+            ThreadPool.GetMinThreads(out _workerThreads, out _ioThreads);
+            _ct = new CancellationTokenSource(_timeout);
+            for (int i = 0; i < _muxCount; i++)
+            {
+                _multiplexers[i] = ConnectionMultiplexer.Connect($"{_host}:{_port}");
+            }
+            _multiplexers[0].GetDatabase().KeyDelete(_keyName);
+            var t = Task.Factory.StartNew(() => printSERedisResults());
+            for (int i = 0; i < _appClients; i++)
+            {
+                ThreadPool.QueueUserWorkItem(state => SERedisQuery(_multiplexers[i % _muxCount]));
+                Console.WriteLine($"Created {i + 1} application threads");
+                Console.WriteLine($"number of fields in hash {_hashSize}, multiplexers {_muxCount}, application threads {i}, .net worker threads {_workerThreads}, .net io threads {_ioThreads}");
+                if (_dynamic)
+                {
+                    Thread.Sleep(1000);
+                }
+            }
+            t.Wait();
+        }
+
+        private static void ServiceStackRedisQuery(object obj)
+        {
+            int requestsSent = 0;
+            while (!_ct.IsCancellationRequested && requestsSent < _requests)
+            {
+                Thread.Sleep(_rand.Next(1, 20));
+                var redisManager = (IRedisClientsManager)obj;
+                using var redis = redisManager.GetClient();
+
+                var start = DateTime.Now;
+                redis.GetAllEntriesFromHash(_keyName);
+                var entries = new Dictionary<string, string>();
+                for (var i = 0; i < _hashSize; i++)
+                {
+                    var str = i.ToString();
+                    entries[str] = str;
+                }
+                redis.SetRangeInHash(_keyName, entries);
+                Interlocked.Increment(ref _counter);
+                Interlocked.Add(ref _latency, (DateTime.Now - start).Ticks);
+                requestsSent++;
+            }
+        }
+
+        private static void ServiceStackBenchmark()
+        {
+            _ct = new CancellationTokenSource(_timeout);
+            IRedisClientsManager redisManager = new RedisManagerPool($"{_host}:{_port}");
+            var t = Task.Factory.StartNew(() => printStackServiceResults());
+            for (int i = 0; i < _appClients; i++)
+            {
+                ThreadPool.QueueUserWorkItem(state => ServiceStackRedisQuery(redisManager));
+                Console.WriteLine($"ServiceStack.Redis Created {i + 1} application clients");
+                if (_dynamic)
+                {
+                    Thread.Sleep(1000);
+                }
+            }
+            t.Wait();
+        }
+
+        private static void execute()
+        {
+            if (_profile)
+            {
+                Console.WriteLine($"Waiting 30 seconds for you to run attach with monitor tools. PID is {Process.GetCurrentProcess().Id}");
+                Thread.Sleep(30000);
+            }
+            ServiceStackBenchmark();
+            // SERedisBenchmark();
+        }
+
+        public static void printStackServiceResults()
         {
             while (!_ct.IsCancellationRequested)
             {
-                Thread.Sleep(1000);
+                Thread.Sleep(_timeout);
+                Console.WriteLine($"number of fields in hash {_hashSize}, application clients {_appClients}");
+                Console.WriteLine($"Avg requests {Interlocked.Read(ref _counter)}");
+                Console.WriteLine($"Avg latency {0.001 * (double)Interlocked.Read(ref _latency) / Interlocked.Read(ref _counter)}ms");
+                Interlocked.Exchange(ref _counter, 0);
+                Interlocked.Exchange(ref _latency, 0);
+            }
+        }
+
+
+        public static void printSERedisResults()
+        {
+            while (!_ct.IsCancellationRequested)
+            {
+                Thread.Sleep(_timeout);
                 for (int i = 0; i < _muxCount; i++)
                 {
                     Console.WriteLine(_multiplexers[i].GetStatus());
                 }
-                Console.WriteLine($"number of fields in hash {_hashSize}, multiplexers {_muxCount}, application threads {_appThreads}, .net worker threads {_workerThreads}, .net io threads {_ioThreads}");
+                Console.WriteLine($"number of fields in hash {_hashSize}, multiplexers {_muxCount}, application threads {_appClients}, .net worker threads {_workerThreads}, .net io threads {_ioThreads}");
                 Console.WriteLine($"Avg requests {Interlocked.Read(ref _counter)}");
                 Console.WriteLine($"Avg latency {0.001 * (double)Interlocked.Read(ref _latency) / Interlocked.Read(ref _counter)}ms");
                 Interlocked.Exchange(ref _counter, 0);
